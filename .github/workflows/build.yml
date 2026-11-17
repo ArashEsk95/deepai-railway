@@ -116,24 +116,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Redeploy Railway
-        if: steps.source.outputs.changed == 'true' && vars.RAILWAY_SERVICE_NAME != ''
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          SERVICE_NAME: ${{ vars.RAILWAY_SERVICE_NAME }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "$RAILWAY_TOKEN" ]]; then
-            echo "::error::RAILWAY_TOKEN is missing."
-            exit 1
-          fi
-
-          npx --yes @railway/cli@latest redeploy \
-            --service "$SERVICE_NAME" \
-            --yes
-
       - name: Save Upstream Version
         if: steps.source.outputs.changed == 'true'
         shell: bash
