@@ -1,0 +1,157 @@
+
+name: DeepAICode2API Railway Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force rebuild and redeploy"
+        required: false
+        type: boolean
+        default: false
+
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: deepai-railway-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+
+      - name: Clone Upstream Source
+        id: source
+        shell: bash
+        env:
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          git clone https://github.com/2951461586/DeepAICode2API.git upstream
+
+          SHA="$(git -C upstream rev-parse HEAD)"
+          VERSION="$(git -C upstream describe --tags --always)"
+          PREVIOUS="$(cat upstream.sha 2>/dev/null || true)"
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [[ "$SHA" != "$PREVIOUS" || "$FORCE_BUILD" == "true" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Upstream: $SHA"
+          echo "Version: $VERSION"
+
+      - name: Patch Dockerfile for Railway
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="upstream/Dockerfile"
+
+          if ! grep -Eq '^VOLUME[[:space:]]+\["/data"\][[:space:]]*$' "$FILE"; then
+            echo "::error::Expected VOLUME instruction was not found. Inspect upstream Dockerfile."
+            exit 1
+          fi
+
+          sed -i -E '/^VOLUME[[:space:]]+\["\/data"\][[:space:]]*$/d' "$FILE"
+
+          if grep -Eq '^VOLUME[[:space:]]' "$FILE"; then
+            echo "::error::Unsupported VOLUME instruction remains."
+            exit 1
+          fi
+
+          echo "Dockerfile patched successfully."
+
+      - name: Define Image Name
+        id: image
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        if: steps.source.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: steps.source.outputs.changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Publish Image
+        if: steps.source.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          platforms: linux/amd64
+          push: true
+
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ steps.source.outputs.sha }}
+
+          build-args: |
+            VERSION=${{ steps.source.outputs.version }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Redeploy Railway
+        if: steps.source.outputs.changed == 'true' && vars.RAILWAY_SERVICE_NAME != ''
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVICE_NAME: ${{ vars.RAILWAY_SERVICE_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$RAILWAY_TOKEN" ]]; then
+            echo "::error::RAILWAY_TOKEN is missing."
+            exit 1
+          fi
+
+          npx --yes @railway/cli@latest redeploy \
+            --service "$SERVICE_NAME" \
+            --yes
+
+      - name: Save Upstream Version
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "${{ steps.source.outputs.sha }}" > upstream.sha
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add upstream.sha
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync DeepAICode2API upstream"
+            git push
+          fi
+
+      - name: No Updates
+        if: steps.source.outputs.changed == 'false'
+        run: echo "Upstream has no new commits. Skipping build."
